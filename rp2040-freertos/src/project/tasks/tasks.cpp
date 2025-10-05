@@ -13,6 +13,18 @@
 #include "tasks_data.h"
 #include "ssd1306os.h"
 
+// New file: OLED layout .h insertion
+#include "project/ScreenViews/oled_layouts.h"
+
+// Debounce time for the pushbutton #define in tasks_data.h BUTTON_DEBOUNCE_MS = 250;
+
+// One-time setup and ISR
+static void ui_inputs_init(void);
+static void ui_gpio_isr(uint gpio, uint32_t events);
+
+// queue handler defined -Chedel
+QueueHandle_t uiQueue = nullptr;
+
 SemaphoreHandle_t gpio_sem = nullptr;
 QueueHandle_t co2Queue = nullptr;
 
@@ -33,7 +45,6 @@ QueueHandle_t co2Queue = nullptr;
 
 #define USE_MODBUS
 #define CO2_VALVE_GPIO 27
-
 void modbus_task(void *param) {
     auto *s = static_cast<SystemObjects*>(param);
     uint32_t last_display_time = 0;
@@ -53,9 +64,9 @@ void modbus_task(void *param) {
             t  = s->t_sensor->read()/10.0;
             co2 = s->co2_sensor->read();
             fan = s->fan_control->read()/10.0;
-            float co2_ppm = co2 / 10.0f;
+            float co2_ppm = co2*10;
             xSemaphoreGive(s->modbus_mutex);
-            xQueueOverwrite(co2Queue, &co2_ppm);
+            xQueueOverwrite(co2Queue, &co2_ppm); // overwrite the old value with latest. so queue doesnt block when its full. for xQueueSend it blocks when its full.
 
             printf("RH=%5.1f%%, T=%5.1fC, CO2=%5.1f ppm, Fan AO1=%5.1f%%, Pulses=%u\n",
                    rh , t , co2_ppm, fan , pulses);
@@ -73,46 +84,78 @@ void controller_task(void *param) {
     gpio_init(CO2_VALVE_GPIO);
     gpio_set_dir(CO2_VALVE_GPIO, true); // output
     gpio_put(CO2_VALVE_GPIO, 0);
-    const TickType_t inject_time = pdMS_TO_TICKS(2000);  // 2s injection
+    const TickType_t inject_time = pdMS_TO_TICKS(1500);  // 2s injection
     const TickType_t wait_time = pdMS_TO_TICKS(10000);
     float co2level;
     float setpoint = s->co2_setpoint;
     while (true) {
         if (xQueueReceive(co2Queue, &co2level, portMAX_DELAY)) {
             float fanlevel = 0.0f;
-
+            printf("Co2 level in the controller: %f\n", co2level);
             if (co2level > 2000.0f) {
                 fanlevel = 500.0f;
-                //stop injecting and fan runs until co2 is below 2000
                 gpio_put(CO2_VALVE_GPIO, 0);
                 printf("ALARM!!! CO2 above 2000 fan is on\n");
             } else if (co2level > setpoint-50) { // 1500 < co2 <= 2000
-                fanlevel = 0.0f;
+                while (true) {
+                    xQueueReceive(co2Queue, &co2level, pdMS_TO_TICKS(500));
+                    if (co2level < setpoint - 50) {
+                        gpio_put(CO2_VALVE_GPIO, 1);
+                        //printf("Injecting co2 (valve ON)\n");
+                        vTaskDelay(inject_time);
+                        gpio_put(CO2_VALVE_GPIO, 0);
+                        //printf("Valve OFF, waiting for stabilization...\n");
+                        vTaskDelay(wait_time);
+                        printf("Waiting done...\n");
+                    } else if (co2level>setpoint + 50) {
+                        //printf("CO2 above max point. Valve OFF\n");
+                        fanlevel = 300.0f;
+
+                        gpio_put(CO2_VALVE_GPIO, 0);
+                    } else if (co2level > setpoint - 50 || co2level < setpoint + 50) {
+                        //printf("CO2 arround set point. Valve OFF\n");
+                        gpio_put(CO2_VALVE_GPIO, 0);
+                        fanlevel = 0.0f;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    xSemaphoreTake(s->modbus_mutex, portMAX_DELAY);
+                    s->fan_control->write(fanlevel);
+                    xSemaphoreGive(s->modbus_mutex);
+                }
                 // need to stop injecting and no fan
                 gpio_put(CO2_VALVE_GPIO, 0);
                 printf("CO2 above set point.Stopping injection\n");
             } else if (co2level < setpoint -50) { // co2 <= 1500
-                fanlevel = 0.0f;
-                // inject CO2 and fan off
-
-                printf("lets inject co2\n");
-
                 while (true) {
-                    xQueueReceive(co2Queue, &co2level, pdMS_TO_TICKS(500));
-
+                    xQueueReceive(co2Queue, &co2level, pdMS_TO_TICKS(500)); // here if no reading then it will use last reading
+                    //if (xQueueReceive(co2Queue, &co2level, pdMS_TO_TICKS(500)) == pdTRUE){
+                    //  if(){
+                    //  }else{
+                    //      gpio_put(CO2_VALVE_GPIO, 0); //here it wait for new reading. if not we can notify no rading so we can keep valve close
+                    //  }
+                    //}
                     if (co2level < setpoint - 50) {
                         gpio_put(CO2_VALVE_GPIO, 1);
-                        printf("Injecting co2 (valve ON)\n");
+                        //printf("Injecting co2 (valve ON)\n");
                         vTaskDelay(inject_time);
                         gpio_put(CO2_VALVE_GPIO, 0);
-                        printf("Valve OFF, waiting for stabilization...\n");
+                        //printf("Valve OFF, waiting for stabilization...\n");
                         vTaskDelay(wait_time);
-                    } else {
-                        printf("CO2 above set point. Valve OFF\n");
-                        gpio_put(CO2_VALVE_GPIO, 0);
-                    }
+                        printf("Waiting done...\n");
+                    } else if (co2level>setpoint + 50) {
+                        //printf("CO2 above max point. Valve OFF\n");
+                        fanlevel = 300.0f;
 
+                        gpio_put(CO2_VALVE_GPIO, 0);
+                    } else if (co2level > setpoint - 50 || co2level < setpoint + 50) {
+                        //printf("CO2 arround set point. Valve OFF\n");
+                        gpio_put(CO2_VALVE_GPIO, 0);
+                        fanlevel = 0.0f;
+                    }
                     vTaskDelay(pdMS_TO_TICKS(100));
+                    xSemaphoreTake(s->modbus_mutex, portMAX_DELAY);
+                    s->fan_control->write(fanlevel);
+                    xSemaphoreGive(s->modbus_mutex);
                 }
 
             }
@@ -126,31 +169,238 @@ void controller_task(void *param) {
 
 void co2_injecting_task(void *param) {
     auto *data = static_cast<Data*>(param);
-
+    auto *s = static_cast<SystemObjects*>(param);
     // Initialize valve GPIO
     gpio_init(CO2_VALVE_GPIO);
     gpio_set_dir(CO2_VALVE_GPIO, true); // output
     gpio_put(CO2_VALVE_GPIO, 0);        // valve initially OFF
+    float co2level;
+    float fanlevel;
+    float setpoint = s->co2_setpoint;
+    const TickType_t inject_time = pdMS_TO_TICKS(1500);  // 2s injection
+    const TickType_t wait_time = pdMS_TO_TICKS(30000); // 10s wait period
 
-    const TickType_t inject_time = pdMS_TO_TICKS(2000);  // 2s injection
-    const TickType_t stabilization_time = pdMS_TO_TICKS(10000); // 10s wait period
-    float co2level = 0.0f;
-    data->co2_setpoint = 1800;
+    //data->co2_setpoint = 1800;
     while (true) {
-        // Wait up to 500ms for a new reading, otherwise keep last value
-        xQueueReceive(co2Queue, &co2level, pdMS_TO_TICKS(500));
-
-        if (co2level < data->co2_setpoint - 50) {
-            printf("Injecting CO2... (valve ON)\n");
-            // injection code...
-        } else {
-            printf("CO2 above set point. Valve OFF\n");
+        xQueueReceive(co2Queue, &co2level, pdMS_TO_TICKS(500)); // here if no reading then it will use last reading
+        //if (xQueueReceive(co2Queue, &co2level, pdMS_TO_TICKS(500)) == pdTRUE){
+        //  if(){
+        //  }else{
+        //      gpio_put(CO2_VALVE_GPIO, 0); //here it wait for new reading. if not we can notify no rading so we can keep valve close
+        //  }
+        //}
+        if (co2level < setpoint - 50) {
+            gpio_put(CO2_VALVE_GPIO, 1);
+            //printf("Injecting co2 (valve ON)\n");
+            vTaskDelay(inject_time);
             gpio_put(CO2_VALVE_GPIO, 0);
-        }
+            //printf("Valve OFF, waiting for stabilization...\n");
+            vTaskDelay(wait_time);
+        } else if (co2level>setpoint + 50) {
+            //printf("CO2 above max point. Valve OFF\n");
+            fanlevel = 300.0f;
 
+            gpio_put(CO2_VALVE_GPIO, 0);
+        } else if (co2level > setpoint - 50 || co2level < setpoint + 50) {
+            //printf("CO2 arround set point. Valve OFF\n");
+            gpio_put(CO2_VALVE_GPIO, 0);
+            fanlevel = 0.0f;
+        }
         vTaskDelay(pdMS_TO_TICKS(100));
+        xSemaphoreTake(s->modbus_mutex, portMAX_DELAY);
+        s->fan_control->write(fanlevel);
+        xSemaphoreGive(s->modbus_mutex);
     }
 }
+
+// Toggled  - Mark
+/*
+void ui_task(void *param) {
+    auto *s = static_cast<SystemObjects*>(param);
+    auto i2cbus{std::make_shared<PicoI2C>(1, 400000)};
+
+    ssd1306os display(i2cbus);
+    display.fill(0);
+    display.text("Group 6", 38,10);
+    display.text("Mark,Visal", 27,30);
+    display.text("Chedel", 42,40);
+    display.show();
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    while (true) {
+        display.fill(0);
+        display.rect(22,39,88,10,1,true); // SET NETWORK
+        //display.rect(22,24,88,10,1,true); // when this is on we need to set color 0
+        display.text("SET C02", 22, 10, 1);
+        display.text("SHOW STATUS", 22, 25,1);
+        display.text("SET NETWORK", 22, 40, 0);
+        display.show();
+        vTaskDelay(100);
+    }
+}
+*/
+
+/*
+// All Screen Tester ui_task function -Chedel
+void ui_task(void *param) {
+    (void)param;
+    auto i2cbus = std::make_shared<PicoI2C>(1, 400000);
+    static OledLayouts display(i2cbus);
+
+
+    // quick test sequence:
+    display.welcomeScreen();
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    display.mainMenu();
+    vTaskDelay(pdMS_TO_TICKS(9000));
+
+    display.setCo2Screen(1305);
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    display.statusScreen(1580, 1500, 45, 22, 30);
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    display.networkScreen("SmartIoT", "********"); //dummy values
+    for(;;)
+        vTaskDelay(pdMS_TO_TICKS(1000));
+}
+*/
+
+// C02 Menu Navigation and exit -Chedel
+void ui_task(void *param)
+{
+    (void)param;
+
+    ui_inputs_init();
+
+    auto i2cbus = std::make_shared<PicoI2C>(1, 400000);
+    OledLayouts display(i2cbus);
+
+
+    enum class Screen { Welcome, MainMenu, SetCo2, Status };
+    enum class SetCo2Focus { Exit, C02, Save };
+
+    Screen screen = Screen::Welcome;
+    int mainSel = 0;                 // 0=CO2, 1=STATUS, 2=NETWORK
+    const int mainItemCount = 3;
+
+    SetCo2Focus focus = SetCo2Focus::C02;
+    int currentPpm = 1305;           // dummy Value
+
+    // Draw helpers
+    auto drawMainMenuBySel = [&](int sel) {
+        switch (sel) {
+            case 0:
+                display.mainMenu_C02();
+            break;
+
+            case 1:
+                display.mainMenu_STATUS();
+            break;
+
+            case 2:
+                display.mainMenu_NETWORK();
+            break;
+
+            default:
+                display.mainMenu_C02();
+            break;
+        }
+    };
+    auto drawSetCo2ByFocus = [&]() {
+        display.setCo2Screen(currentPpm); // currentPpm is a DUmmy Value
+        if (focus == SetCo2Focus::C02) {
+            display.setCo2Screen();
+        } else if (focus == SetCo2Focus::Save){
+            display.setCo2Screen_SAVE();
+        } else if (focus == SetCo2Focus::Exit){
+            display.setCo2Screen_EXIT();
+        }
+    };
+
+    // boot screen
+    display.welcomeScreen();
+
+    // Screen Changing Speed = moveMinGap
+    TickType_t lastMove = 0;
+    const TickType_t moveMinGap = pdMS_TO_TICKS(200); // 200
+
+    for(;;) {
+        gpio_event_s ev{};
+        if (xQueueReceive(uiQueue, &ev, portMAX_DELAY) != pdTRUE)
+            continue;
+        if (ev.type == event_button) {
+            if (screen == Screen::Welcome) {
+                display.mainMenu();
+                drawMainMenuBySel(mainSel);
+                screen = Screen::MainMenu;
+            }
+            else if (screen == Screen::MainMenu) {
+                if (mainSel == 0) {
+                    screen = Screen::SetCo2;
+                    focus  = SetCo2Focus::Exit;
+                    drawSetCo2ByFocus();
+                }
+                else if (mainSel == 1) {
+                    // STATUS screen
+                    screen = Screen::Status;
+                    display.statusScreen(1580, 1500, 45, 22, 30); // DUMMY VALUES.
+                }
+                else if (mainSel == 2) {
+                    // (later) NETWORK screen ADVANCED REQ
+                }
+            }
+
+            else if (screen == Screen::SetCo2) {
+                if (focus == SetCo2Focus::Exit) {
+                    display.mainMenu();
+                    drawMainMenuBySel(mainSel);
+                    screen = Screen::MainMenu;
+                } else {
+                    display.mainMenu();
+                    drawMainMenuBySel(mainSel);
+                    screen = Screen::MainMenu;
+                }
+            }
+            else if (screen == Screen::Status) {
+                display.mainMenu();
+                drawMainMenuBySel(mainSel);
+                screen = Screen::MainMenu;
+            }
+        }
+        else if (ev.type == event_encoder) {
+            TickType_t now = xTaskGetTickCount();
+            if (now - lastMove < moveMinGap) continue;
+            lastMove = now;
+
+            int net = (ev.direction == rot_rotate_clockwise) ? -1 : +1;
+            for (;;) {
+                gpio_event_s next{};
+                if (xQueueReceive(uiQueue, &next, 0) != pdTRUE) break;
+                if (next.type == event_encoder) {
+                    net += (next.direction == rot_rotate_clockwise) ? -1 : +1;
+                } else {
+                }
+            }
+
+            if (screen == Screen::MainMenu) {
+                if      (net > 0) mainSel = (mainSel + 1) % mainItemCount;
+                else if (net < 0) mainSel = (mainSel + mainItemCount - 1) % mainItemCount;
+                drawMainMenuBySel(mainSel);
+            }
+            else if (screen == Screen::SetCo2) {
+                if (net != 0) {
+                    focus = (focus == SetCo2Focus::Exit) ? SetCo2Focus::Save : SetCo2Focus::Exit;
+                    drawSetCo2ByFocus();
+                }
+            }
+            else if (screen == Screen::Status) {
+                continue;
+            }
+        }
+    }
+}
+
 
 void display_task(void *param) // for led display(UI)
 {
@@ -165,12 +415,72 @@ void display_task(void *param) // for led display(UI)
     while(true) {
         display.fill(0);
         char buf[32];
-        snprintf(buf, sizeof(buf), "RH=%5.1f%%", ptr->rh_return / 10.0);
-        display.text(buf, 0, 0);
+        display.text("boot", 0, 0);
         display.show();
         vTaskDelay(100);
     }
 }
+
+// ISR: keep it tiny  - Chedel
+void ui_gpio_isr(uint gpio, uint32_t events)
+{
+    (void)events;  // keep for future
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    const uint32_t now = to_ms_since_boot(get_absolute_time());
+    static uint32_t last_sw_time = 0;
+
+    gpio_event_s ev{};
+    if (gpio == ROTARY_SW) {
+        // Debounce press on falling edge
+        if (now - last_sw_time >= BUTTON_DEBOUNCE_MS) {
+            last_sw_time = now;
+            ev.type = event_button;
+            ev.direction = rot_rotate_clockwise; // unused for button
+            ev.timestamp = now;
+            if (uiQueue) xQueueSendFromISR(uiQueue, &ev, &xHigherPriorityTaskWoken);
+        }
+    } else if (gpio == ROTARY_A) {
+        // Simple quadrature: read B at A's edge to determine CW/CCW
+        const bool b = gpio_get(ROTARY_B);
+        ev.type = event_encoder;
+        ev.direction = b ? rot_rotate_counterclockwise : rot_rotate_clockwise;
+        ev.timestamp = now;
+        if (uiQueue) xQueueSendFromISR(uiQueue, &ev, &xHigherPriorityTaskWoken);
+    }
+
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+// Configure pins and register exactly one bank callback  - Chedel
+void ui_inputs_init(void)
+{
+    if (!uiQueue) {
+        uiQueue = xQueueCreate(12, sizeof(gpio_event_s));
+    }
+
+    // A/B — inputs w/o pulls
+    gpio_init(ROTARY_A);
+    gpio_set_dir(ROTARY_A, GPIO_IN);
+    gpio_disable_pulls(ROTARY_A);
+
+    gpio_init(ROTARY_B);
+    gpio_set_dir(ROTARY_B, GPIO_IN);
+    gpio_disable_pulls(ROTARY_B);
+
+    // SW — input with pull-up
+    gpio_init(ROTARY_SW);
+    gpio_set_dir(ROTARY_SW, GPIO_IN);
+    gpio_pull_up(ROTARY_SW);
+
+    // Register one bank callback, then enable IRQs per pin
+    gpio_set_irq_enabled_with_callback(ROTARY_A, GPIO_IRQ_EDGE_FALL, true, &ui_gpio_isr);
+    gpio_set_irq_enabled(ROTARY_SW, GPIO_IRQ_EDGE_FALL, true);
+
+    // Optional: also read ROTARY_B edges for higher resolution
+    // gpio_set_irq_enabled(ROTARY_B, GPIO_IRQ_EDGE_FALL, true);
+}
+
+
 
 
 
@@ -293,6 +603,13 @@ void gpio_task(void *param) {
     (void) param;
     const uint button_pin = 9;
     const uint led_pin = 22;
+
+    // commented out for #define gpio inits to be tested if working in tasks_data.h -Chedel
+    /*
+    const uint ROT_A = 10;
+    const uint ROT_B = 11;
+    const uint ROT_SW = 12;
+    */
     const uint delay = pdMS_TO_TICKS(250);
     gpio_init(led_pin);
     gpio_set_dir(led_pin, GPIO_OUT);

@@ -21,6 +21,7 @@ uint32_t read_runtime_ctr(void) {
 }
 
 #include "blinker.h"
+static led_data_s *led_data_for_isr = NULL;
 
 #define TESTING_EEPROM 0x01
 int main()
@@ -29,6 +30,10 @@ int main()
     stdio_init_all();
     printf("\nBoot\n");
     co2Queue = xQueueCreate(1, sizeof(float));
+
+    //UI event Queue -Chedel
+    uiQueue = xQueueCreate(10, sizeof(gpio_event_s));
+
     Uart_s ptr; // this is for uart function
     Data sensor_ptr;
     static SystemObjects sys;
@@ -62,8 +67,8 @@ int main()
                 tskIDLE_PRIORITY + 1, nullptr);
 #endif
 
-#if 0 //UI task
-    xTaskCreate(display_task, "SSD1306", 512, &t_ptr,
+#if 1 //UI task
+    xTaskCreate(ui_task, "SSD1306", 512, &sensor_ptr,
                 tskIDLE_PRIORITY + 1, nullptr); // changed (void *) nullptr --> &t_ptr
 #endif
 
@@ -351,134 +356,26 @@ void modbus_task(void *param) {
 }
 
 #include "ssd1306os.h"
-
-
-// CHEDEL Display starts here. This code to be integrated migrated in src/Project/Display  ..... // CHEDEL Display starts here. This code to be integrated migrated in src/Project/Display  .....
-
-//Welcome_Display
-#if 0
-void display_task(void *param)
+void display_task(void *param) // for led display(UI)
 {
+    auto *ptr = static_cast<tasks_return*>(param);
     auto i2cbus{std::make_shared<PicoI2C>(1, 400000)};
     ssd1306os display(i2cbus);
     display.fill(0);
-    display.text("Group 6", 38, 10);
-    display.text("Mark,Visal", 27, 30);
-    display.text("Chedel", 42, 40);
+
+    //display.text("Display is ok", 0, 0);
+    // display ptr->rh.read()
     display.show();
     while(true) {
+        display.fill(0);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "RH=%5.1f%%", ptr->rt_return / 10.0);
+        display.text(buf, 0, 0);
+        display.show();
         vTaskDelay(100);
     }
 
 }
-#endif
-
-// Menu Option
-#if 0
-void display_task(void *param)
-{
-    gpio_init(ROT_A);
-    gpio_set_dir(ROT_A, GPIO_IN);
-    gpio_init(ROT_B);
-    gpio_set_dir(ROT_B, GPIO_IN);
-
-    auto i2cbus{std::make_shared<PicoI2C>(1, 400000)};
-    ssd1306os display(i2cbus);
-    display.fill(0);
-    //display.rect(22,9,88,10,1,true); //SET CO2
-    //display.rect(22,24,88,10,1,true); // SHOW STATUS
-    display.rect(22,39,88,10,1,true); // SET NETWORK
-    display.text("SET C02", 22, 10, 1);
-    display.text("SHOW STATUS", 22, 25,1);
-    display.text("SET NETWORK", 22, 40, 0);
-    display.show();
-    while(true) {
-        vTaskDelay(100);
-    }
-}
-
-#endif
-
-
-// Set C02
-#if 0
-void display_task(void *param)
-{
-    gpio_init(ROT_A);
-    gpio_set_dir(ROT_A, GPIO_IN);
-    gpio_init(ROT_B);
-    gpio_set_dir(ROT_B, GPIO_IN);
-
-    auto i2cbus{std::make_shared<PicoI2C>(1, 400000)};
-    ssd1306os display(i2cbus);
-    display.fill(0);
-    display.rect(88,15,35,15,1,true);
-    display.text("1305", 88, 18,0); //
-    display.text("SET NEW", 9, 10);
-    display.text("PPM LVL",9, 23,1);
-    display.text("<-", 0, 48);
-    display.text("SAVE",98, 48);
-    display.show();
-    while(true) {
-        vTaskDelay(100);
-    }
-
-}
-#endif
-
-// View Status
-#if 1
-void display_task(void *param)
-{
-    gpio_init(ROT_A);
-    gpio_set_dir(ROT_A, GPIO_IN);
-    gpio_init(ROT_B);
-    gpio_set_dir(ROT_B, GPIO_IN);
-
-    auto i2cbus{std::make_shared<PicoI2C>(1, 400000)};
-    ssd1306os display(i2cbus);
-    display.fill(0);
-    display.rect(110,52,17,15,1,true); // ->
-    display.text("->", 110, 55,0);
-    display.text("C02.RDG:", 0, 0); // display.text("here we need to pass our variable", 0, 0);
-    display.text("SET.C02: ", 0, 13);
-    display.text("R.HUM:", 0, 26);
-    display.text("TEMP:", 0, 40);
-    display.text("FAN.SP:", 0, 55);
-    display.show();
-    while(true) {
-        vTaskDelay(100);
-    }
-}
-
-#endif
-// Set Network
-#if 0
-void display_task(void *param)
-{
-    gpio_init(ROT_A);
-    gpio_set_dir(ROT_A, GPIO_IN);
-    gpio_init(ROT_B);
-    gpio_set_dir(ROT_B, GPIO_IN);
-
-    auto i2cbus{std::make_shared<PicoI2C>(1, 400000)};
-    ssd1306os display(i2cbus);
-    display.fill(0);
-    display.rect(0,52,17,15,1,true); // <-
-    display.text("<-", 0, 55,0);
-    display.text("SAVE", 95, 55);
-    display.text("SSID: ", 0, 15);
-    display.text("PSSWD:", 0, 33);
-    display.show();
-    while(true) {
-        vTaskDelay(100);
-    }
-}
-#endif
-
-
-// CHEDEL Display ends here. This code to be integrated migrated in src/Project/Display  ..... // CHEDEL Display ends here. This code to be integrated migrated in src/Project/Display  .....
-
 
 void i2c_task(void *param) {
     auto i2cbus{std::make_shared<PicoI2C>(0, 100000)};
